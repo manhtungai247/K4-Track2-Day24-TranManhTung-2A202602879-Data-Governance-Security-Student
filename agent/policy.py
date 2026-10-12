@@ -35,6 +35,12 @@ không phải xác thực người dùng production.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+
+_PRINCIPALS_FILE = Path(__file__).resolve().parent.parent / "data" / "principals.json"
+_CLASSIFICATIONS = {"public", "internal", "restricted"}
 
 
 @dataclass(frozen=True)
@@ -52,4 +58,38 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    if context.data_classification not in _CLASSIFICATIONS:
+        return False, "Unknown data classification"
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "Restricted data cannot be sent through an egress tool"
+
+    try:
+        principals = json.loads(_PRINCIPALS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, "Principal policy could not be loaded"
+    principal = principals.get(context.principal_id)
+    if principal is None:
+        return False, "Unknown principal"
+    if not context.agent_owner or not context.requested_tool:
+        return False, "Agent identity or requested tool is missing"
+    if context.requested_tool not in principal.get("allowed_tools", []):
+        return False, f"Principal {context.principal_id} is not allowed to use {context.requested_tool}"
+    if context.requested_tool not in context.agent_scopes:
+        return False, "Requested tool is outside agent scopes"
+    if context.delegation_depth < 0:
+        return False, "Delegation depth is invalid"
+    if context.delegation_depth > 0 and context.requested_tool not in context.parent_scopes:
+        return False, "Requested tool is outside parent scopes"
+    if context.request_purpose not in principal.get("purposes", []):
+        return False, f"Purpose {context.request_purpose!r} is not allowed for {context.principal_id}"
+    try:
+        expires_at = datetime.fromisoformat(context.expires_at.replace("Z", "+00:00"))
+        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            raise ValueError("expiry must include a timezone")
+        if expires_at.utcoffset() != timezone.utc.utcoffset(expires_at):
+            return False, "Authorization expiry must be UTC"
+        if expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+            return False, "Authorization has expired"
+    except (AttributeError, TypeError, ValueError):
+        return False, "Authorization expiry is missing or invalid"
+    return True, f"{context.principal_id} may use {context.requested_tool} for {context.request_purpose}"

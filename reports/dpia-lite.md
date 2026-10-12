@@ -1,6 +1,6 @@
-# DPIA-lite — điền trong checkpoint 5
+# DPIA-lite — bài lab dữ liệu tổng hợp
 
-1. Loại dữ liệu và phân loại:
-2. Mục đích xử lý và principal:
-3. Dữ liệu đi qua những run/tool nào, endpoint nào:
-4. Bằng chứng deny/allow và giới hạn của mock:
+1. **Loại dữ liệu và phân loại:** Ticket trong `corpus/` được coi là internal; hồ sơ ở `data/customers.json` chứa CCCD, số điện thoại, số tài khoản, email và được coi là restricted. Toàn bộ record trong repo là synthetic.
+2. **Mục đích và principal:** `summarize-tickets` cho thao tác tìm/đọc ticket; `support-reply` cho bước đọc hồ sơ được liên kết. `support_l1` và `dpo` là principal fixture. `--as` không xác minh danh tính người vận hành.
+3. **Luồng dữ liệu:** Run A gọi `search_docs`, trích ticket ID từ tên file và redact PII trong bản sao đưa tới `llm.summarize`. Run B ánh xạ ticket ID qua `related_tickets`, kiểm policy ngay trước mỗi `read_customer`; nội dung tự do không chọn customer. Lệnh egress riêng được đánh giá là restricted + egress và bị từ chối trước `http_post`. Sink thử nghiệm chỉ là `127.0.0.1:10024`.
+4. **Bằng chứng và giới hạn:** `reports/attack-before.log` ghi bốn POST baseline synthetic; `reports/attack-after.log` dài 0 byte. `reports/ledger.jsonl` xác minh được, có deny `http_post` với reason và `on_behalf_of=dpo`. Mock, regex, principal giả lập và hash-chain trong một file chỉ minh họa hành vi lab; không chứng minh an toàn production, tuân thủ, hay chống xóa đuôi/ghi lại toàn bộ ledger.

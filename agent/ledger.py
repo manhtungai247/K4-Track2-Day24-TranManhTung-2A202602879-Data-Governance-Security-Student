@@ -37,12 +37,51 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
+
+_ZERO_HASH = "0" * 64
+
+
+def _hash(entry: dict) -> str:
+    encoded = json.dumps(entry, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    path = Path(path)
+    previous_hash = _ZERO_HASH
+    if path.exists() and path.stat().st_size:
+        last = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+        previous_hash = last["hash"]
+    recorded = dict(entry)
+    recorded.pop("hash", None)
+    recorded["prev_hash"] = previous_hash
+    recorded["hash"] = _hash(recorded)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(recorded, ensure_ascii=False, sort_keys=True) + "\n")
+    return recorded
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    path = Path(path)
+    if not path.exists():
+        return False
+    previous_hash = _ZERO_HASH
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    return False
+                entry = json.loads(line)
+                saved_hash = entry.pop("hash", None)
+                if not str(entry.get("reason", "")).strip():
+                    return False
+                if entry.get("prev_hash") != previous_hash or saved_hash != _hash(entry):
+                    return False
+                previous_hash = saved_hash
+        return True
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return False

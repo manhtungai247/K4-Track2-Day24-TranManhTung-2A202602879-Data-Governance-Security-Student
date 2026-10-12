@@ -30,10 +30,41 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+
+_PATTERNS = (
+    ("EMAIL", re.compile(r"(?<![\w.+-])[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?)+", re.I)),
+    ("VN_CCCD", re.compile(r"(?<!\d)\d{12}(?!\d)")),
+    ("VN_PHONE", re.compile(r"(?<!\d)0(?:\d[ .-]?){8,9}\d(?!\d)")),
+    ("VN_BANK_ACCOUNT", re.compile(r"(?<!\d)\d{8,16}(?!\d)")),
+)
+_ACCOUNT_LABEL = re.compile(r"(?:\bSTK\b|số\s+tài\s+khoản)", re.I)
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    candidates = []
+    for entity_type, pattern in _PATTERNS:
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            if entity_type == "VN_BANK_ACCOUNT":
+                context = text[max(0, start - 64):start]
+                if not _ACCOUNT_LABEL.search(context):
+                    continue
+            candidates.append({"type": entity_type, "start": start, "end": end})
+
+    # Prefer the specific label-aware account, CCCD, phone and email matches
+    # when numeric spans overlap; return stable, non-overlapping source ranges.
+    priority = {"EMAIL": 0, "VN_BANK_ACCOUNT": 1, "VN_CCCD": 2, "VN_PHONE": 3}
+    selected = []
+    for item in sorted(candidates, key=lambda e: (priority[e["type"]], e["start"], -(e["end"] - e["start"]))):
+        if any(item["start"] < other["end"] and other["start"] < item["end"] for other in selected):
+            continue
+        selected.append(item)
+    return sorted(selected, key=lambda e: e["start"])
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    for entity in reversed(detect(text)):
+        text = text[:entity["start"]] + f"[REDACTED_{entity['type']}]" + text[entity["end"]:]
+    return text

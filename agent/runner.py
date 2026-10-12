@@ -59,7 +59,15 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 from pathlib import Path
+import re
+from uuid import uuid4
+
+from agent import ledger, pii, policy, tools
+from agent.policy import PolicyContext
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
@@ -71,4 +79,82 @@ class RunnerScaffoldPending(NotImplementedError):
 
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    run_id = str(uuid4())
+    agent_id = "lab24-agent"
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    ledger_path = Path(log_dir) / "ledger.jsonl" if log_dir is not None else DEFAULT_LEDGER_PATH
+    principal_path = Path(__file__).resolve().parent.parent / "data" / "principals.json"
+    try:
+        principals = json.loads(principal_path.read_text(encoding="utf-8"))
+        principal = principals.get(principal_id, {})
+        agent_scopes = tuple(principal.get("allowed_tools", []))
+        purposes = principal.get("purposes", [])
+    except (OSError, json.JSONDecodeError):
+        agent_scopes, purposes = (), []
+    parent_scopes = agent_scopes
+
+    def request_tool(tool_name: str, args: dict, classification: str,
+                     purpose: str, operation, *, egress: bool = False,
+                     delegation_depth: int = 0):
+        context = PolicyContext(
+            data_classification=classification,
+            request_purpose=purpose,
+            agent_owner=f"{agent_id}/{run_id}",
+            delegation_depth=delegation_depth,
+            egress_enabled=egress,
+            principal_id=principal_id,
+            requested_tool=tool_name,
+            agent_scopes=agent_scopes,
+            parent_scopes=parent_scopes if delegation_depth else (),
+            expires_at=expires_at,
+        )
+        allowed, reason = policy.check(context)
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "on_behalf_of": principal_id,
+            "expires_at": expires_at,
+            "tool": tool_name,
+            "args_hash": hashlib.sha256(json.dumps(args, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest(),
+            "classification": classification,
+            "decision": "allow" if allowed else "deny",
+            "reason": reason or "Policy returned no reason",
+        }
+        ledger.append(entry, ledger_path)
+        return operation() if allowed else None
+
+    # Run A reads untrusted tickets only. Ticket IDs cross the boundary solely
+    # through filenames; free text is never used to select a customer.
+    docs = request_tool(
+        "search_docs", {"query": message}, "internal", "summarize-tickets",
+        lambda: tools.search_docs(message),
+    ) or []
+    safe_docs = [{**doc, "text": pii.redact(doc["text"])} for doc in docs]
+    ticket_ids = sorted({int(match.group(1)) for doc in docs
+                         if (match := re.fullmatch(r"ticket-(\d+)\.md", doc["id"]))})
+
+    # Trusted relationship data maps ticket IDs to customer IDs. The DPO may
+    # read related records; denied principals still get an auditable decision.
+    customers_path = Path(__file__).resolve().parent.parent / "data" / "customers.json"
+    try:
+        customers = json.loads(customers_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        customers = []
+    related = [record for record in customers
+               if set(ticket_ids).intersection(record.get("related_tickets", []))]
+    injected = llm.find_injection("\n\n".join(doc["text"] for doc in docs))
+    if injected is not None:
+        for customer in related:
+            request_tool(
+                "read_customer", {"customer_id": customer["customer_id"]},
+                "restricted", "support-reply",
+                lambda customer_id=customer["customer_id"]: tools.read_customer(customer_id),
+                delegation_depth=1,
+            )
+        request_tool(
+            "http_post", {"url": injected.target_url}, "restricted", "support-reply",
+            lambda: tools.http_post(injected.target_url, {}), egress=True,
+            delegation_depth=1,
+        )
+    return llm.summarize(safe_docs)
